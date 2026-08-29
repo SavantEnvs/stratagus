@@ -1,0 +1,13 @@
+project: savantenvs/stratagus
+target: netinit_fuzz
+
+testsuite:
+    - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+    - file://mayhem/netinit_fuzz/testsuite
+
+cmds:
+    - cmd: /mayhem/netinit_fuzz
+      libfuzzer: true
+      timeout: 30
+      env:
+        MFUZZ_COMPAT_LEVEL: '2'

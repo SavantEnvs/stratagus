@@ -1,0 +1,107 @@
+// mayhem/netinit_fuzz.cpp.src — libFuzzer harness for the CInitMessage_*
+// family (src/network/net_message.cpp / src/include/net_message.h), the
+// wire format for Stratagus's pre-game multiplayer handshake (client<->host
+// negotiation before the simulation starts: hello, version/map checks,
+// lobby state sync, map-file transfer).
+//
+// Real dispatch (src/network/netconnect.cpp, NetworkParseSetupEvent) reads a
+// 2-byte CInitMessage_Header (type, subtype) off the wire and then routes to
+// CClient::Parse / CServer::Parse, which each switch on `subtype` and call
+// the matching CInitMessage_X::Deserialize(buf). This harness reproduces
+// that same subtype -> Deserialize dispatch directly (bypassing the
+// connection state machine itself, which needs live sockets/game state and
+// is not part of the wire-format parser we're targeting), so it exercises
+// the exact byte-parsing code paths a malicious peer can drive.
+//
+// Buffer sizing mirrors NetworkEvent()'s receive buffer
+// (src/network/network.cpp): `std::max(CInitMessage_State::Size(), 1024)`
+// bytes, zero-padded — CInitMessage_State is the largest of this family (it
+// embeds a full CServerSetup, ~1.1KB), so this is large enough for every
+// subtype's Deserialize to read its fixed fields without running off the end
+// of a short fuzzer input, exactly like upstream's oversized real buffer.
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+
+#include "net_message.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+	static constexpr size_t kBufCap =
+		std::max<size_t>(CInitMessage_State::Size(), 1024);
+
+	auto buf = std::make_unique<unsigned char[]>(kBufCap);
+	std::memset(buf.get(), 0, kBufCap);
+	const size_t copyLen = std::min(Size, kBufCap);
+	if (copyLen) {
+		std::memcpy(buf.get(), Data, copyLen);
+	}
+
+	CInitMessage_Header header;
+	header.Deserialize(buf.get());
+
+	switch (header.GetSubType()) {
+		case ICMHello: {
+			CInitMessage_Hello m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMConfig: {
+			CInitMessage_Config m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMEngineMismatch: {
+			CInitMessage_EngineMismatch m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMLuaFilesMismatch: {
+			CInitMessage_LuaFilesMismatch m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMWelcome: {
+			CInitMessage_Welcome m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMMap: {
+			CInitMessage_Map m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMState: {
+			CInitMessage_State m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMResync: {
+			CInitMessage_Resync m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMMapNeeded: {
+			CInitMessage_MapFileFragment m;
+			m.Deserialize(buf.get());
+			break;
+		}
+		case ICMEngineConfMismatch:
+		case ICMMapUidMismatch:
+		case ICMGameFull:
+		case ICMWaiting:
+		case ICMServerQuit:
+		case ICMGoodBye:
+		case ICMSeeYou:
+		case ICMGo:
+		case ICMAYT:
+		case ICMIAH:
+		default:
+			// header-only messages (no body) — nothing further to parse.
+			break;
+	}
+
+	return 0;
+}

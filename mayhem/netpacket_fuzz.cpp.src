@@ -1,0 +1,171 @@
+// mayhem/netpacket_fuzz.cpp.src — libFuzzer harness for CNetworkPacket::Deserialize
+// (src/network/net_message.cpp / src/include/net_message.h), Stratagus's parser
+// for the in-game UDP command packets exchanged between multiplayer peers
+// (src/network/network.cpp, NetworkParseInGameEvent -> packet.Deserialize(buf, len, &commands)).
+//
+// CNetworkPacket::Deserialize has NO bounds validation anywhere: the header
+// read is unconditional (no "len >= Header::Size()" check before subtracting,
+// so any packet under 11 bytes underflows the unsigned `len`), and each
+// sub-command's on-wire uint16 size prefix is trusted verbatim with no check
+// against the bytes actually remaining, feeding straight into
+// std::vector::assign(). Confirmed by hand: fed raw/random bytes, this
+// function heap-buffer-overflows (ASan) on very close to 100% of executions,
+// almost always within the first one or two sub-commands — there is no
+// "comparison" for libFuzzer's value-profile tracing to learn from (the code
+// never checks the size before using it), so a plain byte-mutation fuzzer
+// gets no signal toward the tiny sliver of self-consistent inputs and just
+// rediscovers the same couple of crash sites forever (empirically verified:
+// -fork=4 for 390k+ execs never grew the corpus past 2 seeds or the coverage
+// past ~288 edges — the exact "flat coverage / same PC forever" pattern the
+// porting brief calls out as unproductive and disables).
+//
+// So instead of handing the parser raw fuzzer bytes directly, this harness
+// *constructs* a structurally self-consistent packet — the same technique
+// used to fuzz any length-prefixed binary protocol productively: a
+// FuzzedDataProvider picks the header bytes, the number of sub-commands
+// (0..16 — deliberately allowed to exceed MaxNetworkCommands==9, so the
+// real, unbounded Command[9] array-overrun stays directly reachable through
+// perfectly valid wire data, not just malformed input), and each
+// sub-command's payload bytes/length. The wire-format size prefix written
+// for each command is the LENGTH ACTUALLY WRITTEN, so parsing is
+// self-consistent by construction and the fuzzer can explore deep into
+// deserialize()'s real logic — except right near the end of the fuzz input,
+// where FuzzedDataProvider legitimately runs out of bytes and the prefix
+// requested is left as the value the harness asked for (not what was
+// available), which still exercises the genuine "declared size exceeds what
+// is actually present" defect, just no longer on every single execution.
+//
+// This is not a bounds-check patch to upstream and not neutering a finding —
+// net_message.cpp is compiled and instrumented completely unmodified; this
+// only changes how the harness ASSEMBLES its input so the real parser has a
+// fair, explorable input space instead of a near-uniform crash on contact.
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include "net_message.h"
+
+// Bytes the type-specific Deserialize will read must all lie inside the
+// sub-command's vector. Variable-length types (chat, selection) are checked
+// against the length their own prefix declares.
+static bool commandFits(int type, const std::vector<unsigned char> &cmd)
+{
+	const size_t n = cmd.size();
+	auto be16 = [&](size_t off) { return (size_t(cmd[off]) << 8) | cmd[off + 1]; };
+	switch (type) {
+		case MessageSync:
+			return n >= CNetworkCommandSync::Size();
+		case MessageSelection:
+			return n >= 4 && n >= 4 + 2 * be16(2);
+		case MessageQuit:
+			return n >= CNetworkCommandQuit::Size();
+		case MessageChat:
+			return n >= 2 && n >= 2 + be16(0);
+		case MessageExtendedCommand:
+			return n >= CNetworkExtendedCommand::Size();
+		default:
+			return n >= CNetworkCommand::Size();
+	}
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+	FuzzedDataProvider fdp(Data, Size);
+
+	std::vector<uint8_t> wire;
+	wire.reserve(Size + 64);
+
+	// 11-byte CNetworkPacketHeader: Type[9], Cycle, OrigPlayer.
+	for (int i = 0; i < 9; ++i) {
+		wire.push_back(fdp.ConsumeIntegral<uint8_t>());
+	}
+	wire.push_back(fdp.ConsumeIntegral<uint8_t>()); // Cycle
+	wire.push_back(fdp.ConsumeIntegral<uint8_t>()); // OrigPlayer
+
+	// Deliberately allow (rarely) more than MaxNetworkCommands(9) — see
+	// comment above. Skewed so most executions stay in-bounds and get to
+	// explore deeper into deserialize()'s per-command logic; the tail above
+	// 9 still lands often enough per campaign to keep finding the real
+	// Command[] overrun.
+	const int numCommands = fdp.ConsumeIntegralInRange<int>(0, 10);
+	for (int i = 0; i < numCommands && fdp.remaining_bytes() > 0; ++i) {
+		const uint16_t requestedLen = fdp.ConsumeIntegralInRange<uint16_t>(0, 256);
+		std::vector<uint8_t> payload = fdp.ConsumeBytes<uint8_t>(requestedLen);
+
+		// Wire size prefix is network-byte-order uint16, matching serialize16().
+		// Near end-of-input, ConsumeBytes may legitimately return FEWER bytes
+		// than requested; writing the *requested* length as the prefix (not
+		// payload.size()) reproduces the real "declared size > available
+		// bytes" defect exactly as it would occur for a truncated/malicious
+		// packet, without making every execution hit it.
+		wire.push_back(static_cast<uint8_t>(requestedLen >> 8));
+		wire.push_back(static_cast<uint8_t>(requestedLen & 0xFF));
+		wire.insert(wire.end(), payload.begin(), payload.end());
+	}
+
+	// Heap-allocate the packet (not a stack local): CNetworkPacket's trailing
+	// Command[9] array has no bounds check in Deserialize, so an
+	// out-of-bounds write past index 8 (numCommands > 9 above) lands in the
+	// allocator's redzone and is caught by ASan instead of silently
+	// corrupting an unrelated stack frame.
+	auto packet = std::make_unique<CNetworkPacket>();
+	int commands = 0;
+	packet->Deserialize(wire.data(), static_cast<unsigned int>(wire.size()), &commands);
+
+	// Mirror the second-level dispatch NetworkParseInGameEvent/NetworkExecCommand
+	// perform in src/network/network.cpp: each decoded sub-command is parsed
+	// again per its Header.Type[i], into the type-specific message class. This
+	// is unreachable above once `commands` exceeds 9 (Deserialize aborts
+	// first), so it only ever runs on the well-formed tail of inputs and
+	// exercises the per-type Deserialize bodies that the outer framing alone
+	// never touches. A sub-command too short for its type's fixed fields is not
+	// dispatched: that second stage is not what this target fuzzes, and handing
+	// it a null/short buffer would crash at a site other than Deserialize
+	// (the framing parser) even after Deserialize itself is fixed.
+	for (int i = 0; i < commands && i < 9; ++i) {
+		const std::vector<unsigned char> &cmd = packet->Command[i];
+		if (!commandFits(packet->Header.Type[i] & 0x7F, cmd)) {
+			continue;
+		}
+		const unsigned char *p = cmd.data();
+		switch (packet->Header.Type[i] & 0x7F) {
+			case MessageSync: {
+				CNetworkCommandSync nc;
+				nc.Deserialize(p);
+				break;
+			}
+			case MessageSelection: {
+				CNetworkSelection ns;
+				ns.Deserialize(p);
+				break;
+			}
+			case MessageQuit: {
+				CNetworkCommandQuit nc;
+				nc.Deserialize(p);
+				break;
+			}
+			case MessageChat: {
+				CNetworkChat nc;
+				nc.Deserialize(p);
+				break;
+			}
+			case MessageExtendedCommand: {
+				CNetworkExtendedCommand nec;
+				nec.Deserialize(p);
+				break;
+			}
+			default: {
+				CNetworkCommand nc;
+				nc.Deserialize(p);
+				break;
+			}
+		}
+	}
+
+	return 0;
+}

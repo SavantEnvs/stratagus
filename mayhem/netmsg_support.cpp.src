@@ -1,0 +1,99 @@
+// mayhem/netmsg_support.cpp.src — minimal link-time scaffolding for fuzzing
+// src/network/net_message.cpp in isolation, WITHOUT dragging in the full
+// engine (SDL/video/audio/Lua/unit-manager/sockets).
+//
+// net_message.cpp (the real upstream file we compile+instrument unmodified)
+// declares/uses a handful of globals and singletons that only matter to the
+// *sending*/logging side of the protocol (CServerSetup::Save, the various
+// CInitMessage_* constructors that stamp an outgoing message with the local
+// engine version). Our harness only ever calls the *Deserialize* methods, so
+// none of this logic is on the path we fuzz — but the translation unit still
+// needs every referenced symbol to resolve at link time. This file supplies
+// trivial, inert definitions for exactly those symbols. Nothing here
+// participates in parsing untrusted bytes.
+//
+// Shipped as a non-compiling extension (mayhem/*.cpp.src) so it is never
+// picked up as an ordinary project source file; mayhem/build.sh copies/renames
+// it into place before compiling.
+
+#include "stratagus.h"
+#include "parameters.h"
+#include "network.h"
+#include "netconnect.h"
+#include "network/netsockets.h"
+
+// stratagus.h extern globals (debug/assert plumbing). Zero/false-initialized,
+// matching upstream's own defaults in src/stratagus/stratagus.cpp — Assert()
+// is therefore a no-op, but AbortAt/PrintLocation still need a body because
+// net_message.cpp's Assert() call sites reference them unconditionally.
+bool EnableDebugPrint = false;
+bool EnableAssert = false;
+bool EnableUnitDebug = false;
+bool IsRestart = false;
+bool IsDebugEnabled = false;
+bool EnableWallsInSinglePlayer = false;
+std::vector<std::string> OriginalArgv;
+const char NameLine[] = "Stratagus (mayhem harness build)";
+std::string StratagusLibPath;
+std::string MenuRace;
+unsigned long GameCycle = 0;
+
+void PrintLocation(const char *file, int line, const char *funcName)
+{
+	fprintf(stderr, "%s:%d: %s: ", file, line, funcName);
+}
+
+void AbortAt(const char *file, int line, const char *funcName, const char *conditionStr)
+{
+	fprintf(stderr, "Assertion failed at %s:%d (%s): %s\n", file, line, funcName, conditionStr);
+	abort();
+}
+
+// util.h
+uint32_t FileChecksums = 0;
+
+#ifndef HAVE_STRNCPYS
+errno_t strncpy_s(char *dst, size_t dstsize, const char *src, size_t count)
+{
+	if (dst == nullptr || src == nullptr || dstsize == 0) {
+		return EINVAL;
+	}
+	size_t mincount = (count == _TRUNCATE) ? strnlen(src, dstsize) : strnlen(src, count);
+	if (mincount >= dstsize) {
+		mincount = dstsize - 1;
+	}
+	memcpy(dst, src, mincount);
+	dst[mincount] = '\0';
+	return 0;
+}
+#endif
+
+// parameters.h singleton — default-constructed, no CLI/env parsing performed.
+Parameters Parameters::Instance;
+
+// network.h singleton — only its two integer fields are ever read (and only
+// from a Serialize()/ctor path our harness never calls).
+CNetworkParameter::CNetworkParameter()
+	: localPort(0), gameCyclesPerUpdate(1), NetworkLag(0), timeoutInS(0)
+{
+}
+void CNetworkParameter::FixValues() {}
+CNetworkParameter CNetworkParameter::Instance;
+
+// network/netsockets.h — only CHost::toString() (used by CServerSetup::Save,
+// never called by the harness) needs a definition; the constructors used by
+// net_message.cpp are inline in the header.
+std::string CHost::toString() const
+{
+	return {};
+}
+bool CHost::isValid() const
+{
+	return false;
+}
+CHost::CHost(const std::string &, int) : ip(0), port(0) {}
+
+// netconnect.h globals — referenced only from CServerSetup::Save (a
+// send/UI-display helper never called on the Deserialize path we fuzz).
+CNetworkHost Hosts[PlayerMax];
+int NetLocalPlayerNumber = 0;
